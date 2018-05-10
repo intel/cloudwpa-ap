@@ -1,0 +1,787 @@
+diff --git a/include/net/l2fou.h b/include/net/l2fou.h
+new file mode 100644
+index 0000000..6f6e463
+--- /dev/null
++++ b/include/net/l2fou.h
+@@ -0,0 +1,53 @@
++/* L2 UDP Encapsulation Protocl
++ *
++ * Copyright (c) 2016, Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#ifndef __L2FOU_H
++#define __L2FOU_H
++
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++
++#include <net/ip_tunnels.h>
++#include <net/udp.h>
++
++#if IS_ENABLED(CONFIG_IPV6)
++#include <net/ipv6.h>
++#include <net/addrconf.h>
++#endif
++
++struct udp_offload {
++ __be16			 port;
++  u8			 ipproto;
++};
++
++struct udp_port_cfg {
++  u8      family;
++
++  /* Used only for kernel-created sockets */
++  union {
++    struct in_addr    local_ip;
++#if IS_ENABLED(CONFIG_IPV6)
++    struct in6_addr   local_ip6;
++#endif
++  };
++
++  union {
++    struct in_addr    peer_ip;
++#if IS_ENABLED(CONFIG_IPV6)
++    struct in6_addr   peer_ip6;
++#endif
++  };
++
++  __be16      local_udp_port;
++  __be16      peer_udp_port;
++  unsigned int    use_udp_checksums:1;
++};
++
++#endif
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 74ecf59..a68f55d 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -188,6 +188,14 @@ config NET_IP_TUNNEL
+ 	tristate
+ 	select DST_CACHE
+ 	default n
++#
++# 
++# L2 Tunneling
++#
++config NET_L2FOU
++	tristate "FOU: L2 Tunneling"
++	help
++	  L2 Tunneling.
+ 
+ config NET_IPGRE
+ 	tristate "IP: GRE tunnels over IP"
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index bc6a6c8..e83c3e8 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -20,6 +20,11 @@ obj-$(CONFIG_PROC_FS) += proc.o
+ obj-$(CONFIG_IP_MULTIPLE_TABLES) += fib_rules.o
+ obj-$(CONFIG_IP_MROUTE) += ipmr.o
+ obj-$(CONFIG_NET_IPIP) += ipip.o
++#
++#
++# L2 Tunneling
++#
++obj-$(CONFIG_NET_L2FOU) += l2fou.o
+ gre-y := gre_demux.o
+ obj-$(CONFIG_NET_FOU) += fou.o
+ obj-$(CONFIG_NET_IPGRE_DEMUX) += gre.o
+diff --git a/net/ipv4/l2fou.c b/net/ipv4/l2fou.c
+new file mode 100644
+index 0000000..6f68ef7
+--- /dev/null
++++ b/net/ipv4/l2fou.c
+@@ -0,0 +1,687 @@
++/* L2 UDP Encapsulation Protocl
++ *
++ * Copyright (c) 2016, Intel Corporation
++ * Authors: Salvator Benedetto <salvatore.benedetto@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++#include <net/l2fou.h>
++
++#include <linux/capability.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/in.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
++#include <linux/if_arp.h>
++#include <linux/mroute.h>
++#include <linux/init.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/if_ether.h>
++
++#include <net/sock.h>
++#include <net/ip.h>
++#include <net/icmp.h>
++#include <net/ip_tunnels.h>
++#include <net/inet_ecn.h>
++#include <net/xfrm.h>
++#include <net/net_namespace.h>
++#include <net/netns/generic.h>
++#include <net/protocol.h>
++#include <linux/etherdevice.h>
++
++//fou.c dependencies
++#include <linux/errno.h>
++#include <linux/socket.h>
++#include <linux/ip.h>
++#include <net/genetlink.h>
++#include <net/udp.h>
++#include <uapi/linux/genetlink.h>
++
++static int l2fou_net_id __read_mostly;
++
++static int l2fou_tunnel_init(struct net_device *dev);
++static struct rtnl_link_ops l2fou_link_ops __read_mostly;
++
++static DEFINE_SPINLOCK(fou_lock);
++static LIST_HEAD(fou_list);
++
++struct fou {
++	struct socket *sock;
++	u8 protocol;
++	u16 port;
++	struct udp_offload udp_offloads;
++	struct list_head list;
++	struct rcu_head rcu;
++};
++
++struct fou_cfg {
++	u8 protocol;
++	struct udp_port_cfg udp_config;
++};
++
++static inline int udp_sock_create(struct net *net,
++          struct udp_port_cfg *cfg,
++          struct socket **sockp);
++
++static inline struct fou *fou_from_sock(struct sock *sk)
++{
++	return sk->sk_user_data;
++}
++
++static const struct tnl_ptk_info tpi = {
++	/* no tunnel info required for ipip. */
++	.proto = htons(ETH_P_IP),
++};
++
++static int fou_udp_recv(struct sock *sk, struct sk_buff *skb)
++{
++	struct fou *fou;
++       struct net *net;
++       struct ip_tunnel_net *itn;
++       struct ip_tunnel *tunnel;
++	struct iphdr *iph;
++	size_t len;
++	u8 protocol;
++
++	fou = fou_from_sock(sk);
++
++	if (!fou)
++		return 1;
++
++	len = sizeof(struct udphdr);
++	iph = ip_hdr(skb);
++	protocol = fou->protocol;
++
++	/* Remove 'len' bytes from the packet (UDP header and
++	 * FOU header if present), modify the protocol to the one
++	 * we found, and then call rcv_encap.
++	 */
++	iph->tot_len = htons(ntohs(iph->tot_len) - len);
++	__skb_pull(skb, len);
++	skb_postpull_rcsum(skb, udp_hdr(skb), len);
++	skb_reset_transport_header(skb);
++
++	net = dev_net(skb->dev);
++	itn = net_generic(net, l2fou_net_id);
++
++
++	tunnel = ip_tunnel_lookup(itn, skb->dev->ifindex, TUNNEL_NO_KEY,
++			iph->saddr, iph->daddr, 0);
++
++	if (tunnel) {
++		skb_pop_mac_header(skb);
++		skb_reset_network_header(skb);
++		//TODO research log_ecn_error (fifth arguments 'false'). 
++		return ip_tunnel_rcv(tunnel, skb, &tpi, 0, false);
++	}
++
++	return -1;
++}
++
++static int fou_add_to_port_list(struct fou *fou)
++{
++	struct fou *fout;
++	printk(KERN_DEBUG "L2 FOU: port added [%d]\n", fou->port);
++	spin_lock(&fou_lock);
++	list_for_each_entry(fout, &fou_list, list) {
++		if (fou->port == fout->port) {
++			spin_unlock(&fou_lock);
++			return -EALREADY;
++		}
++	}
++
++	list_add(&fou->list, &fou_list);
++	spin_unlock(&fou_lock);
++
++	return 0;
++}
++
++static void fou_release(struct fou *fou)
++{
++	struct socket *sock = fou->sock;
++	struct sock *sk = sock->sk;
++
++	list_del(&fou->list);
++
++	/* Remove hooks into tunnel socket */
++	sk->sk_user_data = NULL;
++
++	sock_release(sock);
++
++	kfree_rcu(fou, rcu);
++}
++
++static int fou_create(struct net *net, struct fou_cfg *cfg)
++{
++	struct fou *fou = NULL;
++	int err;
++	struct socket *sock = NULL;
++	struct sock *sk;
++
++	/* Open UDP socket */
++	err = udp_sock_create(net, &cfg->udp_config, &sock);
++	if (err < 0)
++		goto error;
++
++	/* Allocate FOU port structure */
++	fou = kzalloc(sizeof(*fou), GFP_KERNEL);
++	if (!fou) {
++		err = -ENOMEM;
++		goto error;
++	}
++
++	sk = sock->sk;
++
++	fou->port = cfg->udp_config.local_udp_port;
++
++	/* Initial for fou type */
++	udp_sk(sk)->encap_rcv = fou_udp_recv;
++	fou->protocol = cfg->protocol;
++	fou->udp_offloads.port = cfg->udp_config.local_udp_port;
++	fou->udp_offloads.ipproto = cfg->protocol;
++
++	udp_sk(sk)->encap_type = 1;
++	udp_encap_enable();
++
++	sk->sk_user_data = fou;
++	fou->sock = sock;
++
++	sk->sk_allocation = GFP_ATOMIC;
++
++	err = fou_add_to_port_list(fou);
++	if (err)
++		goto error;
++
++	return 0;
++
++error:
++	kfree(fou);
++	if (sock)
++		sock_release(sock);
++
++	return err;
++}
++
++static int fou_destroy(struct net *net, struct fou_cfg *cfg)
++{
++	struct fou *fou;
++	u16 port = cfg->udp_config.local_udp_port;
++	int err = -EINVAL;
++
++	spin_lock(&fou_lock);
++	list_for_each_entry(fou, &fou_list, list) {
++		if (fou->port == port) {
++			fou_release(fou);
++			err = 0;
++			break;
++		}
++	}
++	spin_unlock(&fou_lock);
++
++	return err;
++}
++
++static int fou_build_header(struct net *net, struct sk_buff *skb, struct ip_tunnel_encap *e,
++                size_t hdr_len)
++{
++	struct udphdr *uh;
++	__be16 sport;
++
++	if (IS_ERR(skb))
++		return PTR_ERR(skb);
++
++	/* Get length and hash before making space in skb */
++
++	if (e->sport) {
++		sport = e->sport;
++	}
++	else {
++		u32 hash;
++		int min = 0;
++		int max = 0;
++
++		inet_get_local_port_range(net, &min, &max);
++
++		hash = skb_get_hash(skb);
++		if (unlikely(!hash) && false) {
++			/* Can't find a normal hash, caller has indicated an Ethernet
++			 * packet so use that to compute a hash.
++			 */
++			hash = jhash(skb->data, 2 * ETH_ALEN,
++					(__force u32) skb->protocol);
++		}
++
++		/* Since this is being sent on the wire obfuscate hash a bit
++		 * to minimize possbility that any useful information to an
++		 * attacker is leaked. Only upper 16 bits are relevant in the
++		 * computation for 16 bit port value.
++		 */
++		hash ^= hash << 16;
++
++		sport =  htons((((u64) hash * (max - min)) >> 32) + min);
++	}
++
++	skb_push(skb, hdr_len);
++
++	skb_reset_transport_header(skb);
++	uh = udp_hdr(skb);
++
++	uh->dest = e->dport;
++	uh->source = sport;
++	uh->len = htons(skb->len);
++	uh->check = 0;
++
++	return 0;
++}
++
++/*
++ *	This function assumes it is being called from dev_queue_xmit()
++ *	and that skb is filled properly by that function.
++ */
++static netdev_tx_t l2fou_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct ip_tunnel *tunnel = netdev_priv(dev);
++	const struct iphdr  *tiph = &tunnel->parms.iph;
++
++	if (likely(!skb->encapsulation)) {
++		skb_reset_inner_headers(skb);
++		skb->encapsulation = 1;
++	}
++	//For UDP header
++	if (skb_cow_head(skb, dev->needed_headroom))
++		goto free_skb;
++
++	if (fou_build_header(tunnel->net, skb, &tunnel->encap, sizeof(struct udphdr)) < 0)
++		goto tx_error;
++	ip_tunnel_xmit(skb, dev, tiph, tiph->protocol);
++	return NETDEV_TX_OK;
++
++free_skb:
++	dev_kfree_skb(skb);
++tx_error:
++	dev->stats.tx_errors++;
++	dev_kfree_skb(skb);
++	return NETDEV_TX_OK;
++}
++
++static const struct net_device_ops l2fou_netdev_ops = {
++	.ndo_init       = l2fou_tunnel_init,
++	.ndo_uninit     = ip_tunnel_uninit,
++	.ndo_start_xmit	= l2fou_tunnel_xmit,
++	.ndo_set_mac_address	= eth_mac_addr,
++	.ndo_validate_addr	= eth_validate_addr,
++	.ndo_change_mtu = ip_tunnel_change_mtu,
++	.ndo_get_stats64 = ip_tunnel_get_stats64,
++};
++
++#define L2_FOU_FEATURES (NETIF_F_SG |		\
++		       NETIF_F_FRAGLIST |	\
++		       NETIF_F_HIGHDMA |	\
++		       NETIF_F_HW_CSUM)
++
++static void l2fou_tunnel_setup(struct net_device *dev)
++{
++	ether_setup(dev);
++	dev->netdev_ops		= &l2fou_netdev_ops;
++	ip_tunnel_setup(dev, l2fou_net_id);
++}
++
++static int l2fou_tunnel_init(struct net_device *dev)
++{
++	struct ip_tunnel *tunnel = netdev_priv(dev);
++
++	tunnel->hlen = 0 + sizeof(struct udphdr);
++	tunnel->parms.iph.protocol = IPPROTO_UDP;
++
++	// added 8 bytes UDP - header
++	dev->needed_headroom	= LL_MAX_HEADER + sizeof(struct iphdr) + 8;
++	dev->mtu		= ETH_DATA_LEN - sizeof(struct iphdr) - 8;
++
++	dev->features		|= NETIF_F_NETNS_LOCAL | L2_FOU_FEATURES;
++
++	return ip_tunnel_init(dev);
++}
++
++/* This function returns true when ENCAP attributes are present in the nl msg */
++static void l2fou_netlink_encap_parms(struct nlattr *data[],
++				     struct ip_tunnel_encap *ipencap, struct ip_tunnel_parm *parms)
++{
++	memset(ipencap, 0, sizeof(*ipencap));
++
++	if (!data) {
++		return;
++	}
++
++	if (data[IFLA_IPTUN_ENCAP_SPORT]) {
++		ipencap->sport = nla_get_u16(data[IFLA_IPTUN_ENCAP_SPORT]);
++	}
++
++	if (data[IFLA_IPTUN_ENCAP_DPORT]) {
++		ipencap->dport = nla_get_u16(data[IFLA_IPTUN_ENCAP_DPORT]);
++	}
++
++	memset(parms, 0, sizeof(*parms));
++
++	parms->iph.version = 4;
++	parms->iph.protocol = IPPROTO_UDP;
++	parms->iph.ihl = 5;
++	parms->link = 0;
++
++	if (data[IFLA_IPTUN_LOCAL])
++		parms->iph.saddr = nla_get_be32(data[IFLA_IPTUN_LOCAL]);
++
++	if (data[IFLA_IPTUN_REMOTE])
++		parms->iph.daddr = nla_get_be32(data[IFLA_IPTUN_REMOTE]);
++
++	if (data[IFLA_IPTUN_TTL]) {
++		parms->iph.ttl = nla_get_u8(data[IFLA_IPTUN_TTL]);
++		if (parms->iph.ttl) {
++			parms->iph.frag_off = htons(IP_DF);
++		}
++	}
++}
++
++static int l2fou_newlink(struct net *src_net, struct net_device *dev,
++			struct nlattr *tb[], struct nlattr *data[])
++{
++	struct ip_tunnel_parm p;
++	struct ip_tunnel_encap ipencap;
++	struct fou_cfg cfg;
++	struct ip_tunnel *t;
++	int err;
++	
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.udp_config.family = AF_INET;
++	cfg.udp_config.local_udp_port = nla_get_u16(data[IFLA_IPTUN_ENCAP_SPORT]);
++	cfg.protocol = 17;
++
++	err = fou_create(&init_net, &cfg);
++	if (err < 0){
++		printk(KERN_DEBUG "L2 FOU: error create [%d] port\n", cfg.udp_config.local_udp_port);
++		return err;
++	}
++	printk(KERN_DEBUG "L2 FOU: new link added\n");
++
++	l2fou_netlink_encap_parms(data, &ipencap, &p);
++	t = netdev_priv(dev);
++	ip_tunnel_encap_setup(t, &ipencap);
++
++	return ip_tunnel_newlink(dev, tb, &p);
++}
++
++static int l2fou_changelink(struct net_device *dev, struct nlattr *tb[],
++			   struct nlattr *data[])
++{
++	struct ip_tunnel_parm p;
++	struct ip_tunnel_encap ipencap;
++	struct ip_tunnel *t;
++
++	l2fou_netlink_encap_parms(data, &ipencap, &p);
++	t = netdev_priv(dev);
++	ip_tunnel_encap_setup(t, &ipencap);
++
++	return ip_tunnel_changelink(dev, tb, &p);
++}
++
++static void l2fou_dellink(struct net_device *dev, struct list_head *head)
++{
++	struct ip_tunnel *tunnel = netdev_priv(dev);
++	struct fou_cfg cfg;
++	int err;
++
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.udp_config.family = AF_INET;
++	cfg.udp_config.local_udp_port = tunnel->encap.sport;
++	cfg.protocol = 17;
++
++	printk(KERN_DEBUG "L2 FOU: dellink port [%d]\n", cfg.udp_config.local_udp_port);
++	err = fou_destroy(&init_net, &cfg);
++	if (err < 0){
++		printk(KERN_DEBUG "L2 FOU: error destroy [%d] port\n", cfg.udp_config.local_udp_port);
++		return;
++	}
++
++	ip_tunnel_dellink(dev, head);
++}
++
++static size_t l2fou_get_size(const struct net_device *dev)
++{
++	return
++		/* IFLA_IPTUN_LINK */
++		nla_total_size(4) +
++		/* IFLA_IPTUN_LOCAL */
++		nla_total_size(4) +
++		/* IFLA_IPTUN_REMOTE */
++		nla_total_size(4) +
++		/* IFLA_IPTUN_TTL */
++		nla_total_size(1) +
++		/* IFLA_IPTUN_SPORT */
++		nla_total_size(2) +
++		/* IFLA_IPTUN_DPORT */
++		nla_total_size(2) +
++		0;
++}
++
++static int l2fou_fill_info(struct sk_buff *skb, const struct net_device *dev)
++{
++	struct ip_tunnel *tunnel = netdev_priv(dev);
++	struct ip_tunnel_parm *parm = &tunnel->parms;
++
++	if (nla_put_be32(skb, IFLA_IPTUN_LOCAL, parm->iph.saddr) ||
++	    nla_put_be32(skb, IFLA_IPTUN_REMOTE, parm->iph.daddr) ||
++	    nla_put_u8(skb, IFLA_IPTUN_TTL, parm->iph.ttl))
++		goto nla_put_failure;
++
++	if (nla_put_u16(skb, IFLA_IPTUN_ENCAP_SPORT,
++			tunnel->encap.sport) ||
++	    nla_put_u16(skb, IFLA_IPTUN_ENCAP_DPORT,
++			tunnel->encap.dport))
++		goto nla_put_failure;
++
++	return 0;
++
++nla_put_failure:
++	return -EMSGSIZE;
++}
++
++static const struct nla_policy l2fou_policy[IFLA_IPTUN_MAX + 1] = {
++	[IFLA_IPTUN_LOCAL]		= { .type = NLA_U32 },
++	[IFLA_IPTUN_REMOTE]		= { .type = NLA_U32 },
++	[IFLA_IPTUN_TTL]		= { .type = NLA_U8 },
++	[IFLA_IPTUN_ENCAP_SPORT]	= { .type = NLA_U16 },
++	[IFLA_IPTUN_ENCAP_DPORT]	= { .type = NLA_U16 },
++};
++
++static struct rtnl_link_ops l2fou_link_ops __read_mostly = {
++	.kind		= "l2fou",
++	.maxtype	= IFLA_IPTUN_MAX,
++	.policy		= l2fou_policy,
++	.priv_size	= sizeof(struct ip_tunnel),
++	.setup		= l2fou_tunnel_setup,
++	.newlink	= l2fou_newlink,
++	.changelink	= l2fou_changelink,
++	.dellink	= l2fou_dellink,
++	.get_size	= l2fou_get_size,
++	.fill_info	= l2fou_fill_info,
++};
++
++static int __net_init l2fou_init_net(struct net *net)
++{
++	printk(KERN_DEBUG "L2 FOU: init\n");
++	return ip_tunnel_init_net(net, l2fou_net_id, &l2fou_link_ops, NULL);
++}
++
++static void __net_exit l2fou_exit_net(struct net *net)
++{
++	struct ip_tunnel_net *itn = net_generic(net, l2fou_net_id);
++	ip_tunnel_delete_net(itn, &l2fou_link_ops);
++}
++
++static struct pernet_operations l2fou_net_ops = {
++	.init = l2fou_init_net,
++	.exit = l2fou_exit_net,
++	.id   = &l2fou_net_id,
++	.size = sizeof(struct ip_tunnel_net),
++};
++
++static int __init l2fou_init(void)
++{
++	int err;
++
++	pr_info("L2 FOU: tunneling driver\n");
++
++	err = register_pernet_device(&l2fou_net_ops);
++	if (err < 0)
++		return err;
++
++	err = rtnl_link_register(&l2fou_link_ops);
++	if (err < 0)
++		goto rtnl_link_failed;
++
++out:
++	return err;
++
++rtnl_link_failed:
++	unregister_pernet_device(&l2fou_net_ops);
++	goto out;
++}
++
++static void __exit l2fou_fini(void)
++{
++	struct fou *fou, *next;
++
++	/* Close all the FOU sockets */
++
++	spin_lock(&fou_lock);
++	list_for_each_entry_safe(fou, next, &fou_list, list)
++		fou_release(fou);
++	spin_unlock(&fou_lock);
++
++	rtnl_link_unregister(&l2fou_link_ops);
++	unregister_pernet_device(&l2fou_net_ops);
++}
++
++int udp_sock_create4(struct net *net, struct udp_port_cfg *cfg,
++         struct socket **sockp)
++{
++	int err = -EINVAL;
++	struct socket *sock = NULL;
++	struct sockaddr_in udp_addr;
++
++	err = sock_create_kern(net, AF_INET, SOCK_DGRAM, 0, &sock);
++	if (err < 0)
++		goto error;
++
++	udp_addr.sin_family = AF_INET;
++	udp_addr.sin_addr = cfg->local_ip;
++	udp_addr.sin_port = cfg->local_udp_port;
++	err = kernel_bind(sock, (struct sockaddr *)&udp_addr,
++			sizeof(udp_addr));
++	if (err < 0)
++		goto error;
++
++	if (cfg->peer_udp_port) {
++		udp_addr.sin_family = AF_INET;
++		udp_addr.sin_addr = cfg->peer_ip;
++		udp_addr.sin_port = cfg->peer_udp_port;
++		err = kernel_connect(sock, (struct sockaddr *)&udp_addr,
++				sizeof(udp_addr), 0);
++		if (err < 0)
++			goto error;
++	}
++
++	sock->sk->sk_no_check_tx = !cfg->use_udp_checksums;
++
++	*sockp = sock;
++	return 0;
++
++error:
++	if (sock) {
++		kernel_sock_shutdown(sock, SHUT_RDWR);
++		sock_release(sock);
++	}
++	*sockp = NULL;
++	return err;
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++int udp_sock_create6(struct net *net, struct udp_port_cfg *cfg,
++         struct socket **sockp)
++{
++	struct sockaddr_in6 udp6_addr;
++	int err;
++	struct socket *sock = NULL;
++
++	err = sock_create_kern(net, AF_INET6, SOCK_DGRAM, 0, &sock);
++	if (err < 0)
++		goto error;
++
++	
++
++	udp6_addr.sin6_family = AF_INET6;
++	memcpy(&udp6_addr.sin6_addr, &cfg->local_ip6,
++			sizeof(udp6_addr.sin6_addr));
++	udp6_addr.sin6_port = cfg->local_udp_port;
++	err = kernel_bind(sock, (struct sockaddr *)&udp6_addr,
++			sizeof(udp6_addr));
++	if (err < 0)
++		goto error;
++
++	if (cfg->peer_udp_port) {
++		udp6_addr.sin6_family = AF_INET6;
++		memcpy(&udp6_addr.sin6_addr, &cfg->peer_ip6,
++				sizeof(udp6_addr.sin6_addr));
++		udp6_addr.sin6_port = cfg->peer_udp_port;
++		err = kernel_connect(sock,
++				(struct sockaddr *)&udp6_addr,
++				sizeof(udp6_addr), 0);
++	}
++	if (err < 0)
++		goto error;
++
++	*sockp = sock;
++	return 0;
++
++error:
++	if (sock) {
++		kernel_sock_shutdown(sock, SHUT_RDWR);
++		sock_release(sock);
++	}
++	*sockp = NULL;
++	return err;
++}
++#else
++static inline int udp_sock_create6(struct net *net, struct udp_port_cfg *cfg,
++           struct socket **sockp)
++{
++  return 0;
++}
++#endif
++
++static inline int udp_sock_create(struct net *net,
++          struct udp_port_cfg *cfg,
++          struct socket **sockp)
++{
++  if (cfg->family == AF_INET)
++    return udp_sock_create4(net, cfg, sockp);
++
++  if (cfg->family == AF_INET6)
++    return udp_sock_create6(net, cfg, sockp);
++
++  return -EPFNOSUPPORT;
++}
++
++module_init(l2fou_init);
++module_exit(l2fou_fini);
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_RTNL_LINK("l2fou");
++MODULE_ALIAS_NETDEV("l2fou0");
